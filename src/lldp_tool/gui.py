@@ -17,6 +17,7 @@ from .npcap import (
     launch_npcap_installer,
 )
 from .packets import PacketBuildError
+from .periodic import CounterByteRule, PeriodicConfigError, PeriodicSendConfig
 from .scapy_io import ScapyLldpRuntime, ScapyRuntimeError
 
 
@@ -40,6 +41,17 @@ def format_received_packet(
     )
 
 
+def format_periodic_send_status(
+    send_count: int,
+    counter_value: int | None,
+    sent_bytes: int,
+) -> str:
+    counter_text = (
+        f"反映byte値: 0x{counter_value:02X}、" if counter_value is not None else ""
+    )
+    return f"周期送信 {send_count}回目に成功しました。{counter_text}送信byte数: {sent_bytes}"
+
+
 class LldpToolApp(tk.Tk):
     def __init__(self, runtime: ScapyLldpRuntime | None = None):
         super().__init__()
@@ -50,17 +62,25 @@ class LldpToolApp(tk.Tk):
         self.adapters: list[AdapterInfo] = []
         self.receiver_stop = threading.Event()
         self.receiver_thread: threading.Thread | None = None
+        self.periodic_stop = threading.Event()
+        self.periodic_thread: threading.Thread | None = None
+        self.periodic_failed = False
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.npcap_var = tk.StringVar(value="Npcap 状態を確認しています。")
         self.admin_var = tk.StringVar(value="")
         self.adapter_var = tk.StringVar(value="")
         self.mode_var = tk.StringVar(value=InputMode.LLDPDU.value)
+        self.periodic_interval_var = tk.StringVar(value="1")
+        self.counter_enabled_var = tk.BooleanVar(value=False)
+        self.counter_position_var = tk.StringVar(value="3")
+        self.counter_start_var = tk.StringVar(value="0x01")
         self.status_var = tk.StringVar(value="準備中です。")
+        self.send_lock_widgets: list[tk.Widget] = []
 
         self._build_widgets()
-        self.refresh_npcap_status()
-        self.refresh_adapters()
+        self.after(0, self.refresh_npcap_status)
+        self.after(50, self.refresh_adapters)
         self.after(100, self._poll_events)
 
     def _build_widgets(self) -> None:
@@ -100,9 +120,10 @@ class LldpToolApp(tk.Tk):
             state="readonly",
         )
         self.adapter_combo.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
-        ttk.Button(adapter_frame, text="更新", command=self.refresh_adapters).grid(
-            row=0, column=2, padx=8, pady=8
+        self.adapter_update_button = ttk.Button(
+            adapter_frame, text="更新", command=self.refresh_adapters
         )
+        self.adapter_update_button.grid(row=0, column=2, padx=8, pady=8)
 
         send_frame = ttk.LabelFrame(self, text="送信")
         send_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
@@ -110,18 +131,20 @@ class LldpToolApp(tk.Tk):
 
         mode_frame = ttk.Frame(send_frame)
         mode_frame.grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
-        ttk.Radiobutton(
+        self.lldpdu_radio = ttk.Radiobutton(
             mode_frame,
             text=InputMode.LLDPDU.value,
             value=InputMode.LLDPDU.value,
             variable=self.mode_var,
-        ).grid(row=0, column=0, padx=(0, 16))
-        ttk.Radiobutton(
+        )
+        self.lldpdu_radio.grid(row=0, column=0, padx=(0, 16))
+        self.ethernet_radio = ttk.Radiobutton(
             mode_frame,
             text=InputMode.ETHERNET_FRAME.value,
             value=InputMode.ETHERNET_FRAME.value,
             variable=self.mode_var,
-        ).grid(row=0, column=1)
+        )
+        self.ethernet_radio.grid(row=0, column=1)
 
         self.input_text = scrolledtext.ScrolledText(send_frame, height=7, wrap="word")
         self.input_text.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -129,15 +152,91 @@ class LldpToolApp(tk.Tk):
 
         send_buttons = ttk.Frame(send_frame)
         send_buttons.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Button(send_buttons, text="送信", command=self.send_packet).grid(
-            row=0, column=0, padx=(0, 8)
+        self.send_button = ttk.Button(
+            send_buttons, text="送信", command=self.send_packet
         )
-        ttk.Button(send_buttons, text="入力をクリア", command=self.clear_input).grid(
-            row=0, column=1, padx=(0, 8)
+        self.send_button.grid(row=0, column=0, padx=(0, 8))
+        self.clear_input_button = ttk.Button(
+            send_buttons, text="入力をクリア", command=self.clear_input
         )
-        ttk.Button(send_buttons, text="入力をコピー", command=self.copy_input).grid(
-            row=0, column=2, padx=(0, 8)
+        self.clear_input_button.grid(row=0, column=1, padx=(0, 8))
+        self.copy_input_button = ttk.Button(
+            send_buttons, text="入力をコピー", command=self.copy_input
         )
+        self.copy_input_button.grid(row=0, column=2, padx=(0, 8))
+
+        periodic_frame = ttk.LabelFrame(send_frame, text="周期送信")
+        periodic_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        periodic_frame.columnconfigure(7, weight=1)
+
+        ttk.Label(periodic_frame, text="周期(秒)").grid(
+            row=0, column=0, sticky="w", padx=(8, 4), pady=8
+        )
+        self.periodic_interval_spin = ttk.Spinbox(
+            periodic_frame,
+            from_=1,
+            to=3600,
+            width=8,
+            textvariable=self.periodic_interval_var,
+        )
+        self.periodic_interval_spin.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=8)
+
+        self.counter_check = ttk.Checkbutton(
+            periodic_frame,
+            text="送信回数をbyteへ反映",
+            variable=self.counter_enabled_var,
+            command=self._update_counter_controls_state,
+        )
+        self.counter_check.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=8)
+
+        ttk.Label(periodic_frame, text="対象byte位置").grid(
+            row=0, column=3, sticky="w", padx=(0, 4), pady=8
+        )
+        self.counter_position_entry = ttk.Entry(
+            periodic_frame,
+            width=8,
+            textvariable=self.counter_position_var,
+        )
+        self.counter_position_entry.grid(row=0, column=4, sticky="w", padx=(0, 12), pady=8)
+
+        ttk.Label(periodic_frame, text="開始値").grid(
+            row=0, column=5, sticky="w", padx=(0, 4), pady=8
+        )
+        self.counter_start_entry = ttk.Entry(
+            periodic_frame,
+            width=8,
+            textvariable=self.counter_start_var,
+        )
+        self.counter_start_entry.grid(row=0, column=6, sticky="w", padx=(0, 12), pady=8)
+
+        self.periodic_start_button = ttk.Button(
+            periodic_frame, text="周期送信開始", command=self.start_periodic_send
+        )
+        self.periodic_start_button.grid(row=0, column=8, sticky="e", padx=(0, 8), pady=8)
+        self.periodic_stop_button = ttk.Button(
+            periodic_frame,
+            text="周期送信停止",
+            command=self.stop_periodic_send,
+            state="disabled",
+        )
+        self.periodic_stop_button.grid(row=0, column=9, sticky="e", padx=(0, 8), pady=8)
+
+        self.send_lock_widgets = [
+            self.adapter_combo,
+            self.adapter_update_button,
+            self.lldpdu_radio,
+            self.ethernet_radio,
+            self.input_text,
+            self.send_button,
+            self.clear_input_button,
+            self.copy_input_button,
+            self.periodic_interval_spin,
+            self.counter_check,
+            self.counter_position_entry,
+            self.counter_start_entry,
+            self.periodic_start_button,
+        ]
+        self._update_counter_controls_state()
 
         receive_frame = ttk.LabelFrame(self, text="受信")
         receive_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=6)
@@ -234,6 +333,135 @@ class LldpToolApp(tk.Tk):
 
         self.status_var.set(f"送信に成功しました。{len(packet.full_frame)} byte")
 
+    def start_periodic_send(self) -> None:
+        if self.periodic_thread and self.periodic_thread.is_alive():
+            return
+
+        try:
+            config = self._build_periodic_config()
+        except (HexParseError, PeriodicConfigError, PacketBuildError) as exc:
+            messagebox.showerror("周期送信", str(exc))
+            self.status_var.set(str(exc))
+            return
+
+        self.periodic_stop.clear()
+        self.periodic_failed = False
+        self.periodic_thread = threading.Thread(
+            target=self._periodic_send_loop,
+            args=(config,),
+            daemon=True,
+        )
+        self._set_periodic_controls_running(True)
+        self.periodic_thread.start()
+        self.status_var.set("周期送信を開始しました。")
+
+    def stop_periodic_send(self) -> None:
+        self.periodic_stop.set()
+        self.periodic_stop_button.configure(state="disabled")
+        self.status_var.set("周期送信停止を要求しました。")
+
+    def _build_periodic_config(self) -> PeriodicSendConfig:
+        adapter = self.selected_adapter()
+        if adapter is None:
+            raise PeriodicConfigError("ネットワークアダプターを選択してください。")
+
+        data = parse_hex_bytes(self.input_text.get("1.0", "end"))
+        counter_rule = None
+        if self.counter_enabled_var.get():
+            counter_rule = CounterByteRule(
+                position=self._parse_counter_position(),
+                start_value=self._parse_counter_start_value(),
+            )
+
+        return PeriodicSendConfig(
+            interval_seconds=self._parse_periodic_interval(),
+            mode=self.mode_var.get(),
+            input_data=data,
+            source_mac=adapter.mac,
+            adapter_name=adapter.name,
+            counter_enabled=self.counter_enabled_var.get(),
+            counter_rule=counter_rule,
+        )
+
+    def _parse_periodic_interval(self) -> int:
+        try:
+            interval = int(self.periodic_interval_var.get().strip())
+        except ValueError as exc:
+            raise PeriodicConfigError("周期は1から3600秒で指定してください。") from exc
+        if interval < 1 or interval > 3600:
+            raise PeriodicConfigError("周期は1から3600秒で指定してください。")
+        return interval
+
+    def _parse_counter_position(self) -> int:
+        try:
+            position = int(self.counter_position_var.get().strip())
+        except ValueError as exc:
+            raise PeriodicConfigError("対象byte位置は1以上で指定してください。") from exc
+        if position < 1:
+            raise PeriodicConfigError("対象byte位置は1以上で指定してください。")
+        return position
+
+    def _parse_counter_start_value(self) -> int:
+        text = self.counter_start_var.get().strip()
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        try:
+            value = int(text, 16)
+        except ValueError as exc:
+            raise PeriodicConfigError("開始値は0x00から0xFFで指定してください。") from exc
+        if value < 0 or value > 0xFF:
+            raise PeriodicConfigError("開始値は0x00から0xFFで指定してください。")
+        return value
+
+    def _periodic_send_loop(self, config: PeriodicSendConfig) -> None:
+        send_count = 0
+        try:
+            while not self.periodic_stop.is_set():
+                send_count += 1
+                try:
+                    result = config.packet_for_send(send_count)
+                    self.runtime.send_frame(config.adapter_name, result.packet.full_frame)
+                except (PeriodicConfigError, PacketBuildError, ScapyRuntimeError) as exc:
+                    self.event_queue.put(("periodic_error", str(exc)))
+                    self.periodic_stop.set()
+                    break
+                except Exception as exc:
+                    self.event_queue.put(
+                        ("periodic_error", f"周期送信中にエラーが発生しました。\n{exc}")
+                    )
+                    self.periodic_stop.set()
+                    break
+
+                self.event_queue.put(
+                    (
+                        "periodic_sent",
+                        (send_count, result.counter_value, len(result.packet.full_frame)),
+                    )
+                )
+                if self.periodic_stop.wait(config.interval_seconds):
+                    break
+        finally:
+            self.event_queue.put(("periodic_stopped", None))
+
+    def _set_periodic_controls_running(self, running: bool) -> None:
+        for widget in self.send_lock_widgets:
+            if widget is self.adapter_combo:
+                widget.configure(state="disabled" if running else "readonly")
+            else:
+                widget.configure(state="disabled" if running else "normal")
+
+        self.periodic_stop_button.configure(state="normal" if running else "disabled")
+        if not running:
+            self._update_counter_controls_state()
+
+    def _update_counter_controls_state(self) -> None:
+        if self.periodic_thread and self.periodic_thread.is_alive():
+            state = "disabled"
+        else:
+            state = "normal" if self.counter_enabled_var.get() else "disabled"
+        self.counter_position_entry.configure(state=state)
+        self.counter_start_entry.configure(state=state)
+
     def clear_input(self) -> None:
         self.input_text.delete("1.0", "end")
 
@@ -302,6 +530,23 @@ class LldpToolApp(tk.Tk):
                 self.stop_button.configure(state="disabled")
                 if self.receiver_stop.is_set():
                     self.status_var.set("受信を停止しました。")
+            elif kind == "periodic_sent":
+                send_count, counter_value, sent_bytes = payload  # type: ignore[misc]
+                self.status_var.set(
+                    format_periodic_send_status(send_count, counter_value, sent_bytes)
+                )
+            elif kind == "periodic_error":
+                message = str(payload)
+                self.periodic_failed = True
+                self.periodic_stop.set()
+                self._set_periodic_controls_running(False)
+                messagebox.showerror("周期送信", message)
+                self.status_var.set(message)
+            elif kind == "periodic_stopped":
+                self.periodic_thread = None
+                self._set_periodic_controls_running(False)
+                if self.periodic_stop.is_set() and not self.periodic_failed:
+                    self.status_var.set("周期送信を停止しました。")
 
         self.after(100, self._poll_events)
 
@@ -316,6 +561,7 @@ class LldpToolApp(tk.Tk):
 
     def destroy(self) -> None:
         self.receiver_stop.set()
+        self.periodic_stop.set()
         super().destroy()
 
 

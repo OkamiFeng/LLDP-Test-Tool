@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from lldp_tool.gui import format_received_packet
+from lldp_tool.gui import format_periodic_send_status, format_received_packet
 from lldp_tool.packets import parse_ethernet_frame
 
 
@@ -21,3 +21,19 @@ def test_format_received_packet_uses_japanese_labels():
     assert "EtherType: 0x88CC" in text
     assert "Ethernet Frame:" in text
     assert "LLDPDU:" in text
+
+
+def test_format_periodic_send_status_includes_counter_value():
+    text = format_periodic_send_status(send_count=2, counter_value=0x02, sent_bytes=64)
+
+    assert "周期送信 2回目に成功しました。" in text
+    assert "反映byte値: 0x02" in text
+    assert "送信byte数: 64" in text
+
+
+def test_format_periodic_send_status_omits_counter_when_disabled():
+    text = format_periodic_send_status(send_count=1, counter_value=None, sent_bytes=32)
+
+    assert "周期送信 1回目に成功しました。" in text
+    assert "反映byte値" not in text
+    assert "送信byte数: 32" in text

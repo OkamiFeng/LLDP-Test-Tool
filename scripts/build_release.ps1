@@ -19,9 +19,21 @@ $LocalNpcapInstaller = Join-Path $LocalDriversDir $NpcapInstallerName
 $PyInstallerWorkDir = Join-Path $Root ".pyinstaller-work"
 $PyInstallerSpecDir = Join-Path $Root ".pyinstaller-spec"
 
+function Invoke-NativeChecked {
+    param(
+        [string]$Name,
+        [scriptblock]$Command
+    )
+
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Name failed. Exit code: $LASTEXITCODE"
+    }
+}
+
 & (Join-Path $PSScriptRoot "bootstrap.ps1")
 
-& $VenvPython -m pytest
+Invoke-NativeChecked "pytest" { & $VenvPython -m pytest }
 
 if (Test-Path $PyInstallerWorkDir) {
     Remove-Item -LiteralPath $PyInstallerWorkDir -Recurse -Force
@@ -30,17 +42,19 @@ if (Test-Path $PyInstallerSpecDir) {
     Remove-Item -LiteralPath $PyInstallerSpecDir -Recurse -Force
 }
 
-& $VenvPython -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --windowed `
-    --name $AppName `
-    --workpath $PyInstallerWorkDir `
-    --specpath $PyInstallerSpecDir `
-    --paths (Join-Path $Root "src") `
-    --hidden-import lldp_tool.gui `
-    --hidden-import scapy.all `
-    (Join-Path $Root "src\lldp_tool\__main__.py")
+Invoke-NativeChecked "PyInstaller" {
+    & $VenvPython -m PyInstaller `
+        --noconfirm `
+        --clean `
+        --windowed `
+        --name $AppName `
+        --workpath $PyInstallerWorkDir `
+        --specpath $PyInstallerSpecDir `
+        --paths (Join-Path $Root "src") `
+        --hidden-import lldp_tool.gui `
+        --hidden-import scapy.all `
+        (Join-Path $Root "src\lldp_tool\__main__.py")
+}
 
 New-Item -ItemType Directory -Force -Path $DriversDir | Out-Null
 
@@ -60,10 +74,10 @@ if ($ExistingNpcap) {
 }
 
 $Launcher = Join-Path $ReleaseDir $LauncherName
-$LauncherText = @"
-@echo off
-for %%F in ("%~dp0LLDP*.exe") do start "" "%%~fF" & exit /b
-"@
+$LauncherText = @(
+    "@echo off",
+    'for %%F in ("%~dp0LLDP*.exe") do start "" "%%~fF" & exit /b'
+) -join [Environment]::NewLine
 Set-Content -Path $Launcher -Value $LauncherText -Encoding ASCII
 
 Remove-Item -LiteralPath $PyInstallerWorkDir -Recurse -Force

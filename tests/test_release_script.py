@@ -6,5 +6,6 @@ def test_build_release_uses_temporary_pyinstaller_workpath_and_cleans_it():
 
     assert "--workpath" in script
     assert "--specpath" in script
+    assert "Invoke-NativeChecked \"PyInstaller\"" in script
     assert "Remove-Item -LiteralPath $PyInstallerWorkDir -Recurse -Force" in script
     assert "Remove-Item -LiteralPath $PyInstallerSpecDir -Recurse -Force" in script
