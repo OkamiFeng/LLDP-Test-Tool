@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Japanese GUI tool for sending and receiving LLDP bytes on Windows."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     "scapy>=2.6.1",
 ]
