@@ -1,0 +1,11 @@
+.venv/
+build/
+dist/
+.pyinstaller-work/
+.pyinstaller-spec/
+*.spec
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+drivers/npcap-*.exe
